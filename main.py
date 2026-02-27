@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from gemini_client import get_gemini_response
 from session_manager import SessionManager
 
+
 import os
 if not os.path.exists("sessions"):
     os.makedirs("sessions")

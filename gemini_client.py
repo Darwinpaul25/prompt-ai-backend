@@ -5,8 +5,10 @@ import os
 from typing import Any
 
 import google.generativeai as genai
+from dotenv import load_dotenv
 
-API_key = "AIzaSyABgAA6YDCz2zmAKabnhmFQHHX43g5AttY"
+load_dotenv()
+API_key = os.getenv("GOOGLE_API_KEY")
 
 SYSTEM_INSTRUCTION = (
     "You are a Requirement Engineer. Your goal is to gather details to create "
