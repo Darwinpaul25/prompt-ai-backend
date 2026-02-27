@@ -18,6 +18,11 @@ class SessionManager:
             raise ValueError("session_id must contain at least one valid character")
         return self.sessions_dir / f"{safe_session_id}.json"
 
+    def session_exists(self, session_id: str) -> bool:
+        """Return True when the session JSON file exists."""
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        return self._session_file(session_id).exists()
+
     def get_history(self, session_id: str) -> list[dict[str, Any]]:
         """Return session history; [] if the session file does not exist."""
         session_file = self._session_file(session_id)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 import google.generativeai as genai
@@ -11,9 +12,17 @@ load_dotenv()
 API_key = os.getenv("GOOGLE_API_KEY")
 
 SYSTEM_INSTRUCTION = (
-    "You are a Requirement Engineer. Your goal is to gather details to create "
-    "an optimized AI prompt. Ask one question at a time. If you have enough info, "
-    "provide a summary and then the final prompt."
+    """
+    Role: You are "Prompt Buddy," a legendary AI architect and the ultimate hype-man for creative ideas! You are an expert in Prompt Engineering and Requirement Elicitation.
+    The Vibe: > * Be Energetic: Use phrases like "Let's go!", "That's a killer idea!", and "We're going to build something epic today! 🚀"
+    Be Supportive: If the user is vague, do't be a robot. Say something like, "Ooh, I see where you're going with this! Help me sharpen the vision..."
+    Use Emojis: Strategically use 1-2 emojis per response to keep the mood light and fun.
+    The Workflow:
+    Phase 1 (The Hook): Celebrate the user's initial goal and ask the first punchy question.
+    Phase 2 (The Deep Dive): Ask exactly ONE question at a time. Use UI elements to make it easy for them.
+    Phase 3 (The Recap): Once you have enough info, say "Alright, let's look at the blueprint! 🛠️" and summarize the requirements.
+    Phase 4 (The Reveal): Deliver the "God-tier" optimized prompt that they can paste elsewhere.
+    """
 )
 
 JSON_RULES = (
@@ -116,3 +125,26 @@ def get_gemini_response(history: list[dict[str, Any]]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Gemini returned non-object JSON")
     return _validate_response(payload)
+
+
+def get_session_title(user_input: str) -> str:
+    """Generate a short (3-4 words) session title from user intent."""
+    api_key = API_key
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is not set")
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+    prompt = (
+        "Summarize the user's intent in exactly 3-4 words. No punctuation.\n\n"
+        f"User input: {user_input}"
+    )
+    response = model.generate_content(prompt, generation_config={"temperature": 0.0})
+    raw_text = (response.text or "").strip()
+    words = [re.sub(r"[^A-Za-z0-9]+", "", w) for w in raw_text.split()]
+    words = [w for w in words if w]
+    if len(words) >= 4:
+        words = words[:4]
+    elif len(words) == 0:
+        words = ["New", "Prompt", "Session"]
+    return " ".join(words)
