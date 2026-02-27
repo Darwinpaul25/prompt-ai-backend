@@ -1,0 +1,23 @@
+# Environment Variables
+.env
+
+# Session Data (Local JSON Database)
+sessions/
+
+# Python cache and temporary files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
