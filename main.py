@@ -1,22 +1,20 @@
 from __future__ import annotations
 
 import json
-import os
-from typing import Any
+import uuid
+from typing import Any, Generator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from auth import TokenRequest, TokenResponse, create_access_token, get_current_user_id
+from database import ChatSession, Message, SessionLocal, User, init_db, utcnow
 from gemini_client import get_gemini_response, get_session_title
-from session_manager import SessionManager
-
-SESSIONS_DIR = "sessions"
-METADATA_FILE = os.path.join(SESSIONS_DIR, "metadata.json")
-os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 app = FastAPI(title="AI Prompt Creation API")
-session_manager = SessionManager()
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,139 +26,207 @@ app.add_middleware(
 
 
 class ChatRequest(BaseModel):
-    session_id: str = Field(..., min_length=1)
-    user_input: str
+    session_id: str = Field(..., min_length=1, max_length=128)
+    user_input: str = Field(..., min_length=1)
 
 
 class SessionRequest(BaseModel):
-    session_id: str = Field(..., min_length=1)
+    session_id: str = Field(..., min_length=1, max_length=128)
 
 
-def _load_metadata() -> list[dict[str, str]]:
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    if not os.path.exists(METADATA_FILE):
-        return []
-
-    with open(METADATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not isinstance(data, list):
-        return []
-
-    normalized: list[dict[str, str]] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        session_id = item.get("id")
-        title = item.get("title")
-        if isinstance(session_id, str) and isinstance(title, str):
-            normalized.append({"id": session_id, "title": title})
-    return normalized
+class SessionListItem(BaseModel):
+    session_id: str
+    title: str
+    updated_at: str
+    preview: str | None = None
 
 
-def update_metadata(session_id: str, title: str) -> None:
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    metadata = _load_metadata()
-    updated = False
+class HistoryMessage(BaseModel):
+    id: str
+    role: str
+    content: str
+    created_at: str
 
-    for item in metadata:
-        if item["id"] == session_id:
-            item["title"] = title
-            updated = True
-            break
 
-    if not updated:
-        metadata.append({"id": session_id, "title": title})
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-    with open(METADATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
+
+
+def _ensure_user(db: Session, user_id: str) -> User:
+    user = db.get(User, user_id)
+    if user is None:
+        user = User(id=user_id)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def _to_gemini_history(messages: list[Message]) -> list[dict[str, Any]]:
+    mapped: list[dict[str, Any]] = []
+    for msg in messages:
+        role = "model" if msg.role == "assistant" else msg.role
+        mapped.append({"role": role, "parts": [msg.content]})
+    return mapped
+
+
+@app.post("/auth/token", response_model=TokenResponse)
+def create_token(payload: TokenRequest, db: Session = Depends(get_db)) -> TokenResponse:
+    _ensure_user(db, payload.user_id)
+    token = create_access_token(payload.user_id)
+    return TokenResponse(access_token=token)
 
 
 @app.post("/chat")
-def chat(payload: ChatRequest) -> dict[str, Any]:
+def chat(
+    payload: ChatRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    _ensure_user(db, user_id)
+
+    session = db.get(ChatSession, payload.session_id)
     is_first_message = False
-    try:
-        is_first_message = not session_manager.session_exists(payload.session_id)
-        history = session_manager.get_history(payload.session_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if session is None:
+        session = ChatSession(id=payload.session_id, user_id=user_id, title="New Session")
+        db.add(session)
+        is_first_message = True
+    elif session.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-    history.append({"role": "user", "parts": [payload.user_input]})
+    user_message = Message(
+        id=uuid.uuid4().hex,
+        session_id=payload.session_id,
+        role="user",
+        content=payload.user_input,
+    )
+    db.add(user_message)
+    session.updated_at = utcnow()
+    db.commit()
+
+    db_history = db.scalars(
+        select(Message).where(Message.session_id == payload.session_id).order_by(Message.created_at.asc())
+    ).all()
 
     try:
-        gemini_response = get_gemini_response(history)
+        gemini_response = get_gemini_response(_to_gemini_history(db_history))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Gemini call failed: {exc}") from exc
 
-    history.append(
-        {
-            "role": "model",
-            "parts": [json.dumps(gemini_response, ensure_ascii=False)],
-        }
+    assistant_message = Message(
+        id=uuid.uuid4().hex,
+        session_id=payload.session_id,
+        role="assistant",
+        content=json.dumps(gemini_response, ensure_ascii=False),
     )
-
-    try:
-        session_manager.save_history(payload.session_id, history)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to save history: {exc}") from exc
+    db.add(assistant_message)
+    session.updated_at = utcnow()
 
     if is_first_message:
         try:
-            title = get_session_title(payload.user_input)
-            update_metadata(payload.session_id, title)
+            session.title = get_session_title(payload.user_input)
         except Exception:
-            # Title generation is a non-blocking secondary call.
             pass
 
+    db.commit()
     return gemini_response
 
 
+@app.get("/sessions", response_model=list[SessionListItem])
+def list_sessions(
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+) -> list[SessionListItem]:
+    sessions = db.scalars(
+        select(ChatSession)
+        .where(ChatSession.user_id == user_id)
+        .order_by(ChatSession.updated_at.desc())
+    ).all()
+
+    items: list[SessionListItem] = []
+    for chat_session in sessions:
+        last_message = db.scalars(
+            select(Message)
+            .where(Message.session_id == chat_session.id)
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        ).first()
+        preview = None
+        if last_message is not None:
+            preview = (last_message.content or "")[:140]
+
+        items.append(
+            SessionListItem(
+                session_id=chat_session.id,
+                title=chat_session.title,
+                updated_at=chat_session.updated_at.isoformat(),
+                preview=preview,
+            )
+        )
+    return items
+
+
+@app.get("/history/{session_id}", response_model=list[HistoryMessage])
+def session_history(
+    session_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+) -> list[HistoryMessage]:
+    session = db.get(ChatSession, session_id)
+    if session is None or session.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+    messages = db.scalars(
+        select(Message).where(Message.session_id == session_id).order_by(Message.created_at.asc())
+    ).all()
+    return [
+        HistoryMessage(
+            id=message.id,
+            role=message.role,
+            content=message.content,
+            created_at=message.created_at.isoformat(),
+        )
+        for message in messages
+    ]
+
+
 @app.post("/reset")
-def reset(payload: SessionRequest) -> dict[str, Any]:
-    try:
-        deleted = session_manager.delete_history(payload.session_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"session_id": payload.session_id, "reset": deleted}
+def reset(
+    payload: SessionRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    session = db.get(ChatSession, payload.session_id)
+    if session is None or session.user_id != user_id:
+        return {"session_id": payload.session_id, "reset": False}
+
+    db.delete(session)
+    db.commit()
+    return {"session_id": payload.session_id, "reset": True}
 
 
 @app.get("/summary/{session_id}")
-def summary(session_id: str) -> dict[str, Any]:
-    try:
-        history = session_manager.get_history(session_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+def summary(
+    session_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    session = db.get(ChatSession, session_id)
+    if session is None or session.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-    user_answers: list[str] = []
-    for message in history:
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") != "user":
-            continue
-        parts = message.get("parts", [])
-        if not isinstance(parts, list):
-            continue
-        if not parts:
-            user_answers.append("")
-            continue
-        first = parts[0]
-        user_answers.append("" if first is None else str(first))
-
-    return {"session_id": session_id, "user_answers": user_answers}
-
-
-@app.get("/sessions")
-def list_sessions() -> list[dict[str, str]]:
-    return _load_metadata()
-
-
-@app.get("/history/{session_id}")
-def session_history(session_id: str) -> list[dict[str, Any]]:
-    try:
-        if not session_manager.session_exists(session_id):
-            raise HTTPException(status_code=404, detail="Session not found")
-        return session_manager.get_history(session_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    user_answers = db.scalars(
+        select(Message.content)
+        .where(Message.session_id == session_id, Message.role == "user")
+        .order_by(Message.created_at.asc())
+    ).all()
+    return {"session_id": session_id, "user_answers": list(user_answers)}

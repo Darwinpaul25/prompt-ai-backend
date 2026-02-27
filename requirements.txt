@@ -3,3 +3,6 @@ uvicorn
 google-generativeai
 python-dotenv
 pydantic
+SQLAlchemy
+python-jose[cryptography]
+psycopg[binary]
