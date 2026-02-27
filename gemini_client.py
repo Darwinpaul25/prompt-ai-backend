@@ -3,13 +3,20 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-load_dotenv()
-API_key = os.getenv("GOOGLE_API_KEY")
+load_dotenv(dotenv_path=Path(__file__).resolve().with_name(".env"))
+
+
+def _get_api_key() -> str:
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is not set")
+    return api_key
 
 SYSTEM_INSTRUCTION = (
     """
@@ -101,11 +108,7 @@ def _validate_response(payload: dict[str, Any]) -> dict[str, Any]:
 
 def get_gemini_response(history: list[dict[str, Any]]) -> dict[str, Any]:
     """Generate the next requirement-engineering turn as strict JSON."""
-    api_key = API_key
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is not set")
-
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=_get_api_key())
     model = genai.GenerativeModel(
         model_name="gemini-2.5-flash",
         system_instruction=SYSTEM_INSTRUCTION,
@@ -121,7 +124,14 @@ def get_gemini_response(history: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
     raw_text = (response.text or "").strip()
-    payload = json.loads(raw_text)
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        # Fallback when the model wraps JSON with extra text.
+        match = re.search(r"\{.*\}", raw_text, flags=re.DOTALL)
+        if not match:
+            raise ValueError("Gemini did not return valid JSON")
+        payload = json.loads(match.group(0))
     if not isinstance(payload, dict):
         raise ValueError("Gemini returned non-object JSON")
     return _validate_response(payload)
@@ -129,11 +139,7 @@ def get_gemini_response(history: list[dict[str, Any]]) -> dict[str, Any]:
 
 def get_session_title(user_input: str) -> str:
     """Generate a short (3-4 words) session title from user intent."""
-    api_key = API_key
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is not set")
-
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=_get_api_key())
     model = genai.GenerativeModel(model_name="gemini-2.5-flash")
     prompt = (
         "Summarize the user's intent in exactly 3-4 words. No punctuation.\n\n"
